@@ -36,7 +36,7 @@ function die(msg: string): never {
   process.exit(1);
 }
 
-async function gh(args: string[]): Promise<string> {
+async function gh(args: string[], throwOnError = false): Promise<string> {
   const proc = Bun.spawn(["gh", ...args], {
     stdout: "pipe",
     stderr: "pipe",
@@ -45,13 +45,14 @@ async function gh(args: string[]): Promise<string> {
   const stderr = await new Response(proc.stderr).text();
   const code = await proc.exited;
   if (code !== 0) {
+    if (throwOnError) throw new Error(stderr.trim());
     die(`gh ${args.join(" ")} failed:\n${stderr.trim()}`);
   }
   return stdout.trim();
 }
 
-async function ghJSON(args: string[]): Promise<any> {
-  const out = await gh(args);
+async function ghJSON(args: string[], throwOnError = false): Promise<any> {
+  const out = await gh(args, throwOnError);
   return JSON.parse(out);
 }
 
@@ -91,7 +92,7 @@ async function graphqlFields(owner: string, number: number): Promise<Record<stri
       "-f", `query=${query}`,
       "-f", `owner=${owner}`,
       "-F", `number=${number}`,
-    ]);
+    ], true);
   } catch {
     // Fallback: try as user instead of org
     data = await ghJSON([
