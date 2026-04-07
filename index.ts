@@ -259,7 +259,49 @@ async function cmdSync() {
   console.log(`Config updated: ${CONFIG_FILE}`);
 }
 
-async function cmdAdd(alias: string, issueNum: string) {
+function resolveFieldOption(proj: ProjectConfig, fieldName: string, optionName: string): { field: FieldConfig; optionId: string } {
+  const field = proj.fields[fieldName];
+  if (!field) die(`No "${fieldName}" field found. Run "gh p sync".`);
+  const optionId = field.options[optionName];
+  if (!optionId) {
+    const available = Object.keys(field.options).join(", ");
+    die(`Unknown ${fieldName.toLowerCase()} "${optionName}". Available: ${available}`);
+  }
+  return { field, optionId };
+}
+
+async function setItemField(proj: ProjectConfig, itemId: string, fieldId: string, optionId: string) {
+  await gh([
+    "project", "item-edit",
+    "--id", itemId,
+    "--project-id", proj.id,
+    "--field-id", fieldId,
+    "--single-select-option-id", optionId,
+  ]);
+}
+
+async function findItemId(proj: ProjectConfig, owner: string, issueNum: string): Promise<string> {
+  const num = parseInt(issueNum, 10);
+  const repoFullName = `${owner}/${proj.repo}`;
+  // Retry: item-list can lag immediately after item-add
+  const delays = [0, 500, 1500, 3000];
+  for (const delay of delays) {
+    if (delay > 0) await new Promise(r => setTimeout(r, delay));
+    const data = await ghJSON([
+      "project", "item-list", String(proj.number),
+      "--owner", owner,
+      "--format", "json",
+      "--limit", "500",
+    ]);
+    const item = data.items.find(
+      (i: any) => i.content?.number === num && i.content?.repository === repoFullName
+    );
+    if (item) return item.id;
+  }
+  die(`Issue #${issueNum} not found in project "${proj.repo}". Did you add it first?`);
+}
+
+async function cmdAdd(alias: string, issueNum: string, statusName?: string, priorityName?: string) {
   const config = loadConfig();
   const proj = getProject(config, alias);
   const owner = proj.owner ?? config.defaultOwner;
@@ -273,47 +315,37 @@ async function cmdAdd(alias: string, issueNum: string) {
   ]);
 
   console.log(`Added issue #${issueNum} to "${alias}" (item ${result.id})`);
+
+  if (statusName) {
+    const { field, optionId } = resolveFieldOption(proj, "Status", statusName);
+    await setItemField(proj, result.id, field.id, optionId);
+    console.log(`Set #${issueNum} status to "${statusName}"`);
+  }
+  if (priorityName) {
+    const { field, optionId } = resolveFieldOption(proj, "Priority", priorityName);
+    await setItemField(proj, result.id, field.id, optionId);
+    console.log(`Set #${issueNum} priority to "${priorityName}"`);
+  }
 }
 
 async function cmdStatus(alias: string, issueNum: string, statusName: string) {
   const config = loadConfig();
   const proj = getProject(config, alias);
   const owner = proj.owner ?? config.defaultOwner;
-
-  const statusField = proj.fields["Status"];
-  if (!statusField) die(`No "Status" field found for "${alias}". Run "gh p sync".`);
-
-  const optionId = statusField.options[statusName];
-  if (!optionId) {
-    const available = Object.keys(statusField.options).join(", ");
-    die(`Unknown status "${statusName}". Available: ${available}`);
-  }
-
-  // Find item ID
-  const data = await ghJSON([
-    "project", "item-list", String(proj.number),
-    "--owner", owner,
-    "--format", "json",
-    "--limit", "500",
-  ]);
-
-  const num = parseInt(issueNum, 10);
-  const repoFullName = `${owner}/${proj.repo}`;
-  const item = data.items.find(
-    (i: any) => i.content?.number === num && i.content?.repository === repoFullName
-  );
-
-  if (!item) die(`Issue #${issueNum} not found in project "${alias}". Did you add it first?`);
-
-  await gh([
-    "project", "item-edit",
-    "--id", item.id,
-    "--project-id", proj.id,
-    "--field-id", statusField.id,
-    "--single-select-option-id", optionId,
-  ]);
-
+  const { field, optionId } = resolveFieldOption(proj, "Status", statusName);
+  const itemId = await findItemId(proj, owner, issueNum);
+  await setItemField(proj, itemId, field.id, optionId);
   console.log(`Set #${issueNum} status to "${statusName}"`);
+}
+
+async function cmdPriority(alias: string, issueNum: string, priorityName: string) {
+  const config = loadConfig();
+  const proj = getProject(config, alias);
+  const owner = proj.owner ?? config.defaultOwner;
+  const { field, optionId } = resolveFieldOption(proj, "Priority", priorityName);
+  const itemId = await findItemId(proj, owner, issueNum);
+  await setItemField(proj, itemId, field.id, optionId);
+  console.log(`Set #${issueNum} priority to "${priorityName}"`);
 }
 
 async function fetchItemStatuses(owner: string, projectNumber: number): Promise<Map<number, string>> {
@@ -435,12 +467,21 @@ function usage() {
   console.log(`Usage: gh p <command>
 
 Commands:
-  init                                   Interactive setup — add projects from any owner
-  sync                                   Refresh cached IDs and field options from GitHub
-  add <alias> <issue-number>             Add an issue to a project
-  status <alias> <issue-number> <name>   Set the status of an issue
-  list <alias> [-v] [--status <name>]     List project items (-v shows status)
-  statuses <alias>                       Show available status options`);
+  init                                                Interactive setup — add projects from any owner
+  sync                                                Refresh cached IDs and field options from GitHub
+  add <alias> <issue> [--status <s>] [--priority <p>] Add an issue to a project (optionally set status/priority)
+  status <alias> <issue> <name>                       Set the status of an issue
+  priority <alias> <issue> <name>                     Set the priority of an issue
+  list <alias> [-v] [--status <name>]                 List project items (-v shows status)
+  statuses <alias>                                    Show available status options`);
+}
+
+function takeFlag(args: string[], name: string): string | undefined {
+  const idx = args.indexOf(name);
+  if (idx < 0) return undefined;
+  const val = args[idx + 1];
+  args.splice(idx, 2);
+  return val;
 }
 
 // --- Main ---
@@ -454,13 +495,21 @@ switch (cmd) {
   case "sync":
     await cmdSync();
     break;
-  case "add":
-    if (args.length < 2) die("Usage: gh p add <alias> <issue-number>");
-    await cmdAdd(args[0], args[1]);
+  case "add": {
+    const addArgs = [...args];
+    const statusFlag = takeFlag(addArgs, "--status");
+    const priorityFlag = takeFlag(addArgs, "--priority");
+    if (addArgs.length < 2) die("Usage: gh p add <alias> <issue-number> [--status <name>] [--priority <name>]");
+    await cmdAdd(addArgs[0], addArgs[1], statusFlag, priorityFlag);
     break;
+  }
   case "status":
     if (args.length < 3) die("Usage: gh p status <alias> <issue-number> <status-name>");
     await cmdStatus(args[0], args[1], args.slice(2).join(" "));
+    break;
+  case "priority":
+    if (args.length < 3) die("Usage: gh p priority <alias> <issue-number> <P0|P1|P2>");
+    await cmdPriority(args[0], args[1], args.slice(2).join(" "));
     break;
   case "list": {
     if (args.length < 1) die("Usage: gh p list <alias> [-v] [--status <name>]");
