@@ -13,6 +13,7 @@ interface FieldConfig {
 }
 
 interface ProjectConfig {
+  owner: string;
   number: number;
   id: string;
   repo: string;
@@ -20,7 +21,7 @@ interface ProjectConfig {
 }
 
 interface Config {
-  owner: string;
+  defaultOwner: string;
   projects: Record<string, ProjectConfig>;
 }
 
@@ -123,7 +124,17 @@ function loadConfig(): Config {
   if (!existsSync(CONFIG_FILE)) {
     die(`No config found. Run "gh p init" first.`);
   }
-  return JSON.parse(readFileSync(CONFIG_FILE, "utf-8"));
+  const raw = JSON.parse(readFileSync(CONFIG_FILE, "utf-8"));
+  // Migrate old format: top-level "owner" → "defaultOwner" + per-project owner
+  if (raw.owner && !raw.defaultOwner) {
+    raw.defaultOwner = raw.owner;
+    delete raw.owner;
+    for (const proj of Object.values(raw.projects) as any[]) {
+      if (!proj.owner) proj.owner = raw.defaultOwner;
+    }
+    saveConfig(raw);
+  }
+  return raw;
 }
 
 function saveConfig(config: Config): void {
@@ -152,14 +163,29 @@ async function cmdInit() {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
 
   try {
-    const owner = await ask(rl, "Owner (org or username)", "evolutionaryherbalism");
+    // Load existing config or start fresh
+    let config: Config;
+    if (existsSync(CONFIG_FILE)) {
+      config = JSON.parse(readFileSync(CONFIG_FILE, "utf-8"));
+      // Migrate old format: top-level owner → per-project owner
+      if ((config as any).owner && !config.defaultOwner) {
+        config.defaultOwner = (config as any).owner;
+        delete (config as any).owner;
+        for (const proj of Object.values(config.projects)) {
+          if (!proj.owner) proj.owner = config.defaultOwner;
+        }
+      }
+      console.log(`Existing config found. Adding projects to existing config.`);
+    } else {
+      config = { defaultOwner: "evolutionaryherbalism", projects: {} };
+    }
+
+    const owner = await ask(rl, "Owner (org or username)", config.defaultOwner);
 
     console.log(`\nFetching projects for "${owner}"...`);
     const data = await ghJSON([
       "project", "list", "--owner", owner, "--format", "json", "--limit", "100",
     ]);
-
-    const projects: Record<string, ProjectConfig> = {};
 
     for (const proj of data.projects) {
       console.log(`\n  #${proj.number}: ${proj.title}`);
@@ -171,7 +197,8 @@ async function cmdInit() {
       console.log(`  Fetching fields for #${proj.number}...`);
       const fields = await graphqlFields(owner, proj.number);
 
-      projects[alias] = {
+      config.projects[alias] = {
+        owner,
         number: proj.number,
         id: proj.id,
         repo,
@@ -184,7 +211,6 @@ async function cmdInit() {
       }
     }
 
-    const config: Config = { owner, projects };
     saveConfig(config);
     console.log(`\nConfig written to ${CONFIG_FILE}`);
   } finally {
@@ -194,29 +220,39 @@ async function cmdInit() {
 
 async function cmdSync() {
   const config = loadConfig();
-  console.log(`Syncing projects for "${config.owner}"...`);
 
-  const data = await ghJSON([
-    "project", "list", "--owner", config.owner, "--format", "json", "--limit", "100",
-  ]);
-
-  // Build a lookup from project number to latest data
-  const latest = new Map<number, any>();
-  for (const proj of data.projects) {
-    latest.set(proj.number, proj);
+  // Group projects by owner to minimize API calls
+  const byOwner = new Map<string, [string, ProjectConfig][]>();
+  for (const [alias, proj] of Object.entries(config.projects)) {
+    const owner = proj.owner ?? config.defaultOwner;
+    if (!byOwner.has(owner)) byOwner.set(owner, []);
+    byOwner.get(owner)!.push([alias, proj]);
   }
 
-  for (const [alias, proj] of Object.entries(config.projects)) {
-    const fresh = latest.get(proj.number);
-    if (!fresh) {
-      console.log(`  Warning: project #${proj.number} ("${alias}") not found, keeping stale config`);
-      continue;
+  for (const [owner, entries] of byOwner) {
+    console.log(`Syncing projects for "${owner}"...`);
+
+    const data = await ghJSON([
+      "project", "list", "--owner", owner, "--format", "json", "--limit", "100",
+    ]);
+
+    const latest = new Map<number, any>();
+    for (const proj of data.projects) {
+      latest.set(proj.number, proj);
     }
 
-    proj.id = fresh.id;
+    for (const [alias, proj] of entries) {
+      const fresh = latest.get(proj.number);
+      if (!fresh) {
+        console.log(`  Warning: project #${proj.number} ("${alias}") not found, keeping stale config`);
+        continue;
+      }
 
-    console.log(`  Refreshing fields for "${alias}" (#${proj.number})...`);
-    proj.fields = await graphqlFields(config.owner, proj.number);
+      proj.id = fresh.id;
+
+      console.log(`  Refreshing fields for "${alias}" (#${proj.number})...`);
+      proj.fields = await graphqlFields(owner, proj.number);
+    }
   }
 
   saveConfig(config);
@@ -226,11 +262,12 @@ async function cmdSync() {
 async function cmdAdd(alias: string, issueNum: string) {
   const config = loadConfig();
   const proj = getProject(config, alias);
-  const url = `https://github.com/${config.owner}/${proj.repo}/issues/${issueNum}`;
+  const owner = proj.owner ?? config.defaultOwner;
+  const url = `https://github.com/${owner}/${proj.repo}/issues/${issueNum}`;
 
   const result = await ghJSON([
     "project", "item-add", String(proj.number),
-    "--owner", config.owner,
+    "--owner", owner,
     "--url", url,
     "--format", "json",
   ]);
@@ -241,6 +278,7 @@ async function cmdAdd(alias: string, issueNum: string) {
 async function cmdStatus(alias: string, issueNum: string, statusName: string) {
   const config = loadConfig();
   const proj = getProject(config, alias);
+  const owner = proj.owner ?? config.defaultOwner;
 
   const statusField = proj.fields["Status"];
   if (!statusField) die(`No "Status" field found for "${alias}". Run "gh p sync".`);
@@ -254,13 +292,13 @@ async function cmdStatus(alias: string, issueNum: string, statusName: string) {
   // Find item ID
   const data = await ghJSON([
     "project", "item-list", String(proj.number),
-    "--owner", config.owner,
+    "--owner", owner,
     "--format", "json",
     "--limit", "500",
   ]);
 
   const num = parseInt(issueNum, 10);
-  const repoFullName = `${config.owner}/${proj.repo}`;
+  const repoFullName = `${owner}/${proj.repo}`;
   const item = data.items.find(
     (i: any) => i.content?.number === num && i.content?.repository === repoFullName
   );
@@ -335,10 +373,11 @@ async function fetchItemStatuses(owner: string, projectNumber: number): Promise<
 async function cmdList(alias: string, statusFilter?: string, verbose = false) {
   const config = loadConfig();
   const proj = getProject(config, alias);
+  const owner = proj.owner ?? config.defaultOwner;
 
   const data = await ghJSON([
     "project", "item-list", String(proj.number),
-    "--owner", config.owner,
+    "--owner", owner,
     "--format", "json",
     "--limit", "500",
   ]);
@@ -347,7 +386,7 @@ async function cmdList(alias: string, statusFilter?: string, verbose = false) {
 
   // Fetch statuses via GraphQL only when needed
   const statusMap = (verbose || statusFilter)
-    ? await fetchItemStatuses(config.owner, proj.number)
+    ? await fetchItemStatuses(owner, proj.number)
     : new Map<number, string>();
 
   const rows: { num: number; title: string; status: string }[] = [];
@@ -396,7 +435,7 @@ function usage() {
   console.log(`Usage: gh p <command>
 
 Commands:
-  init                                   Interactive setup — configure projects and aliases
+  init                                   Interactive setup — add projects from any owner
   sync                                   Refresh cached IDs and field options from GitHub
   add <alias> <issue-number>             Add an issue to a project
   status <alias> <issue-number> <name>   Set the status of an issue
