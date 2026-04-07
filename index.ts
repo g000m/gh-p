@@ -278,7 +278,61 @@ async function cmdStatus(alias: string, issueNum: string, statusName: string) {
   console.log(`Set #${issueNum} status to "${statusName}"`);
 }
 
-async function cmdList(alias: string, statusFilter?: string) {
+async function fetchItemStatuses(owner: string, projectNumber: number): Promise<Map<number, string>> {
+  const query = `
+    query($owner: String!, $number: Int!, $cursor: String) {
+      user(login: $owner) {
+        projectV2(number: $number) {
+          items(first: 100, after: $cursor) {
+            pageInfo { hasNextPage endCursor }
+            nodes {
+              content { ... on Issue { number } ... on PullRequest { number } }
+              fieldValues(first: 20) {
+                nodes {
+                  ... on ProjectV2ItemFieldSingleSelectValue { name field { ... on ProjectV2SingleSelectField { name } } }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  `;
+
+  const statusMap = new Map<number, string>();
+  let cursor: string | null = null;
+
+  while (true) {
+    const args = [
+      "api", "graphql",
+      "-f", `query=${query}`,
+      "-f", `owner=${owner}`,
+      "-F", `number=${projectNumber}`,
+    ];
+    if (cursor) args.push("-f", `cursor=${cursor}`);
+
+    const data = await ghJSON(args);
+    const items = data.data?.user?.projectV2?.items;
+    if (!items) break;
+
+    for (const node of items.nodes) {
+      const num = node.content?.number;
+      if (!num) continue;
+      for (const fv of node.fieldValues.nodes) {
+        if (fv.field?.name === "Status" && fv.name) {
+          statusMap.set(num, fv.name);
+        }
+      }
+    }
+
+    if (!items.pageInfo.hasNextPage) break;
+    cursor = items.pageInfo.endCursor;
+  }
+
+  return statusMap;
+}
+
+async function cmdList(alias: string, statusFilter?: string, verbose = false) {
   const config = loadConfig();
   const proj = getProject(config, alias);
 
@@ -291,24 +345,16 @@ async function cmdList(alias: string, statusFilter?: string) {
 
   let items: any[] = data.items.filter((i: any) => i.content?.number != null);
 
-  // Extract status from fieldValues if available
-  const statusFieldId = proj.fields["Status"]?.id;
+  // Fetch statuses via GraphQL only when needed
+  const statusMap = (verbose || statusFilter)
+    ? await fetchItemStatuses(config.owner, proj.number)
+    : new Map<number, string>();
 
   const rows: { num: number; title: string; status: string }[] = [];
   for (const item of items) {
     const num = item.content.number;
     const title = item.content.title;
-
-    // Find status in fieldValues
-    let status = "";
-    if (item.fieldValues?.nodes) {
-      for (const fv of item.fieldValues.nodes) {
-        if (fv.field?.id === statusFieldId || fv.field?.name === "Status") {
-          status = fv.name ?? fv.value ?? "";
-          break;
-        }
-      }
-    }
+    const status = statusMap.get(num) ?? "";
 
     if (statusFilter && status.toLowerCase() !== statusFilter.toLowerCase()) continue;
     rows.push({ num, title, status });
@@ -326,7 +372,8 @@ async function cmdList(alias: string, statusFilter?: string) {
   for (const r of rows) {
     const n = String(r.num).padStart(numWidth);
     const t = r.title.padEnd(titleWidth);
-    console.log(`  #${n}  ${t}  ${r.status}`);
+    const s = r.status ? `  ${r.status}` : "";
+    console.log(`  #${n}  ${t}${s}`);
   }
 }
 
@@ -353,7 +400,7 @@ Commands:
   sync                                   Refresh cached IDs and field options from GitHub
   add <alias> <issue-number>             Add an issue to a project
   status <alias> <issue-number> <name>   Set the status of an issue
-  list <alias> [--status <name>]         List project items
+  list <alias> [-v] [--status <name>]     List project items (-v shows status)
   statuses <alias>                       Show available status options`);
 }
 
@@ -377,10 +424,12 @@ switch (cmd) {
     await cmdStatus(args[0], args[1], args.slice(2).join(" "));
     break;
   case "list": {
-    if (args.length < 1) die("Usage: gh p list <alias> [--status <name>]");
-    const statusIdx = args.indexOf("--status");
-    const filter = statusIdx >= 0 ? args.slice(statusIdx + 1).join(" ") : undefined;
-    await cmdList(args[0], filter);
+    if (args.length < 1) die("Usage: gh p list <alias> [-v] [--status <name>]");
+    const verbose = args.includes("-v") || args.includes("--verbose");
+    const filtered = args.filter(a => a !== "-v" && a !== "--verbose");
+    const statusIdx = filtered.indexOf("--status");
+    const filter = statusIdx >= 0 ? filtered.slice(statusIdx + 1).join(" ") : undefined;
+    await cmdList(filtered[0], filter, verbose);
     break;
   }
   case "statuses":
