@@ -220,43 +220,83 @@ async function cmdInit() {
 
 async function cmdSync() {
   const config = loadConfig();
+  const interactive = process.stdin.isTTY === true;
+  const rl = interactive ? createInterface({ input: process.stdin, output: process.stdout }) : null;
 
-  // Group projects by owner to minimize API calls
-  const byOwner = new Map<string, [string, ProjectConfig][]>();
-  for (const [alias, proj] of Object.entries(config.projects)) {
-    const owner = proj.owner ?? config.defaultOwner;
-    if (!byOwner.has(owner)) byOwner.set(owner, []);
-    byOwner.get(owner)!.push([alias, proj]);
+  async function prompt(question: string): Promise<string> {
+    if (!rl) return '';
+    return (await rl.question(question)).trim();
   }
 
-  for (const [owner, entries] of byOwner) {
-    console.log(`Syncing projects for "${owner}"...`);
-
-    const data = await ghJSON([
-      "project", "list", "--owner", owner, "--format", "json", "--limit", "100",
-    ]);
-
-    const latest = new Map<number, any>();
-    for (const proj of data.projects) {
-      latest.set(proj.number, proj);
+  try {
+    const byOwner = new Map<string, [string, ProjectConfig][]>();
+    for (const [alias, proj] of Object.entries(config.projects)) {
+      const owner = proj.owner ?? config.defaultOwner;
+      if (!byOwner.has(owner)) byOwner.set(owner, []);
+      byOwner.get(owner)!.push([alias, proj]);
     }
 
-    for (const [alias, proj] of entries) {
-      const fresh = latest.get(proj.number);
-      if (!fresh) {
-        console.log(`  Warning: project #${proj.number} ("${alias}") not found, keeping stale config`);
-        continue;
+    const toRemove: string[] = [];
+    const toRename: [string, string][] = [];
+
+    for (const [owner, entries] of byOwner) {
+      console.log(`Syncing projects for "${owner}"...`);
+
+      const data = await ghJSON([
+        "project", "list", "--owner", owner, "--format", "json", "--limit", "100",
+      ]);
+
+      const latest = new Map<number, any>();
+      for (const proj of data.projects) {
+        latest.set(proj.number, proj);
       }
 
-      proj.id = fresh.id;
+      for (const [alias, proj] of entries) {
+        const fresh = latest.get(proj.number);
+        if (!fresh) {
+          if (interactive) {
+            const answer = (await prompt(`  Project #${proj.number} ("${alias}") no longer exists remotely. Remove from config? [y/N] `)).toLowerCase();
+            if (answer === 'y') {
+              toRemove.push(alias);
+              console.log(`  Removed "${alias}"`);
+            } else {
+              console.log(`  Kept stale config for "${alias}"`);
+            }
+          } else {
+            console.log(`  Warning: project #${proj.number} ("${alias}") not found, keeping stale config`);
+          }
+          continue;
+        }
 
-      console.log(`  Refreshing fields for "${alias}" (#${proj.number})...`);
-      proj.fields = await graphqlFields(owner, proj.number);
+        proj.id = fresh.id;
+
+        if (fresh.title !== alias && interactive) {
+          const answer = await prompt(`  Project #${proj.number} is named "${fresh.title}" but alias is "${alias}". New alias (blank to keep): `);
+          if (answer) toRename.push([alias, answer]);
+        } else if (fresh.title !== alias) {
+          console.log(`  Note: project #${proj.number} is named "${fresh.title}" but alias is "${alias}" (run interactively to rename)`);
+        }
+
+        console.log(`  Refreshing fields for "${alias}" (#${proj.number})...`);
+        proj.fields = await graphqlFields(owner, proj.number);
+      }
     }
-  }
 
-  saveConfig(config);
-  console.log(`Config updated: ${CONFIG_FILE}`);
+    for (const alias of toRemove) {
+      delete config.projects[alias];
+    }
+
+    for (const [oldAlias, newAlias] of toRename) {
+      config.projects[newAlias] = config.projects[oldAlias];
+      delete config.projects[oldAlias];
+      console.log(`  Renamed alias "${oldAlias}" → "${newAlias}"`);
+    }
+
+    saveConfig(config);
+    console.log(`Config updated: ${CONFIG_FILE}`);
+  } finally {
+    rl?.close();
+  }
 }
 
 function resolveFieldOption(proj: ProjectConfig, fieldName: string, optionName: string): { field: FieldConfig; optionId: string } {
