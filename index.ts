@@ -18,6 +18,7 @@ interface ProjectConfig {
   id: string;
   repo: string;
   fields: Record<string, FieldConfig>;
+  excludeStatuses?: string[];
 }
 
 interface Config {
@@ -197,12 +198,18 @@ async function cmdInit() {
       console.log(`  Fetching fields for #${proj.number}...`);
       const fields = await graphqlFields(owner, proj.number);
 
+      const statusOptions = fields["Status"] ? Object.keys(fields["Status"].options) : [];
+      const excludeDefault = statusOptions.filter((s) => s === "Done");
+      const excludeInput = await ask(rl, "  Exclude statuses by default (comma-separated)", excludeDefault.join(", "));
+      const excludeStatuses = excludeInput ? excludeInput.split(",").map((s) => s.trim()).filter(Boolean) : [];
+
       config.projects[alias] = {
         owner,
         number: proj.number,
         id: proj.id,
         repo,
         fields,
+        ...(excludeStatuses.length > 0 ? { excludeStatuses } : {}),
       };
 
       const fieldNames = Object.keys(fields);
@@ -442,10 +449,11 @@ async function fetchItemStatuses(owner: string, projectNumber: number): Promise<
   return statusMap;
 }
 
-async function cmdList(alias: string, statusFilter?: string, verbose = false) {
+async function cmdList(alias: string, statusFilter?: string, verbose = false, all = false) {
   const config = loadConfig();
   const proj = getProject(config, alias);
   const owner = proj.owner ?? config.defaultOwner;
+  const excluded = all ? [] : (proj.excludeStatuses ?? []);
 
   const data = await ghJSON([
     "project", "item-list", String(proj.number),
@@ -456,8 +464,9 @@ async function cmdList(alias: string, statusFilter?: string, verbose = false) {
 
   let items: any[] = data.items.filter((i: any) => i.content?.number != null);
 
-  // Fetch statuses via GraphQL only when needed
-  const statusMap = (verbose || statusFilter)
+  // Fetch statuses when filtering, excluding, or showing verbose
+  const needsStatuses = verbose || statusFilter || excluded.length > 0;
+  const statusMap = needsStatuses
     ? await fetchItemStatuses(owner, proj.number)
     : new Map<number, string>();
 
@@ -468,11 +477,13 @@ async function cmdList(alias: string, statusFilter?: string, verbose = false) {
     const status = statusMap.get(num) ?? "";
 
     if (statusFilter && status.toLowerCase() !== statusFilter.toLowerCase()) continue;
+    if (excluded.some((s) => s.toLowerCase() === status.toLowerCase())) continue;
     rows.push({ num, title, status });
   }
 
   if (rows.length === 0) {
-    console.log(statusFilter ? `No items with status "${statusFilter}"` : "No items found");
+    const hint = !all && excluded.length > 0 ? ` (use --all to include ${excluded.join(", ")})` : "";
+    console.log(statusFilter ? `No items with status "${statusFilter}"` : `No items found${hint}`);
     return;
   }
 
@@ -512,7 +523,7 @@ Commands:
   add <alias> <issue> [--status <s>] [--priority <p>] Add an issue to a project (optionally set status/priority)
   status <alias> <issue> <name>                       Set the status of an issue
   priority <alias> <issue> <name>                     Set the priority of an issue
-  list <alias> [-v] [--status <name>]                 List project items (-v shows status)
+  list <alias> [-v] [--all] [--status <name>]          List project items (-v shows status, --all includes excluded statuses)
   statuses <alias>                                    Show available status options`);
 }
 
@@ -552,12 +563,13 @@ switch (cmd) {
     await cmdPriority(args[0], args[1], args.slice(2).join(" "));
     break;
   case "list": {
-    if (args.length < 1) die("Usage: gh p list <alias> [-v] [--status <name>]");
+    if (args.length < 1) die("Usage: gh p list <alias> [-v] [--all] [--status <name>]");
     const verbose = args.includes("-v") || args.includes("--verbose");
-    const filtered = args.filter(a => a !== "-v" && a !== "--verbose");
+    const all = args.includes("--all");
+    const filtered = args.filter(a => a !== "-v" && a !== "--verbose" && a !== "--all");
     const statusIdx = filtered.indexOf("--status");
     const filter = statusIdx >= 0 ? filtered.slice(statusIdx + 1).join(" ") : undefined;
-    await cmdList(filtered[0], filter, verbose);
+    await cmdList(filtered[0], filter, verbose, all);
     break;
   }
   case "statuses":
