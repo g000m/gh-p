@@ -395,7 +395,25 @@ async function cmdPriority(alias: string, issueNum: string, priorityName: string
   console.log(`Set #${issueNum} priority to "${priorityName}"`);
 }
 
-async function fetchItemStatuses(owner: string, projectNumber: number): Promise<Map<number, string>> {
+interface ItemDetails {
+  status: string;
+  updatedAt: string;
+}
+
+function relativeTime(iso: string): string {
+  const diff = Date.now() - new Date(iso).getTime();
+  const mins = Math.floor(diff / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  if (days < 30) return `${days}d ago`;
+  const months = Math.floor(days / 30);
+  return `${months}mo ago`;
+}
+
+async function fetchItemDetails(owner: string, projectNumber: number): Promise<Map<number, ItemDetails>> {
   const query = `
     query($owner: String!, $number: Int!, $cursor: String) {
       user(login: $owner) {
@@ -403,7 +421,10 @@ async function fetchItemStatuses(owner: string, projectNumber: number): Promise<
           items(first: 100, after: $cursor) {
             pageInfo { hasNextPage endCursor }
             nodes {
-              content { ... on Issue { number } ... on PullRequest { number } }
+              content {
+                ... on Issue { number updatedAt }
+                ... on PullRequest { number updatedAt }
+              }
               fieldValues(first: 20) {
                 nodes {
                   ... on ProjectV2ItemFieldSingleSelectValue { name field { ... on ProjectV2SingleSelectField { name } } }
@@ -416,7 +437,7 @@ async function fetchItemStatuses(owner: string, projectNumber: number): Promise<
     }
   `;
 
-  const statusMap = new Map<number, string>();
+  const detailsMap = new Map<number, ItemDetails>();
   let cursor: string | null = null;
 
   while (true) {
@@ -435,21 +456,41 @@ async function fetchItemStatuses(owner: string, projectNumber: number): Promise<
     for (const node of items.nodes) {
       const num = node.content?.number;
       if (!num) continue;
+      let status = "";
       for (const fv of node.fieldValues.nodes) {
         if (fv.field?.name === "Status" && fv.name) {
-          statusMap.set(num, fv.name);
+          status = fv.name;
         }
       }
+      detailsMap.set(num, {
+        status,
+        updatedAt: node.content?.updatedAt ?? "",
+      });
     }
 
     if (!items.pageInfo.hasNextPage) break;
     cursor = items.pageInfo.endCursor;
   }
 
-  return statusMap;
+  return detailsMap;
 }
 
-async function cmdList(alias: string, statusFilter?: string, verbose = false, all = false) {
+type SortKey = "updated" | "created" | "number";
+
+function parseSince(value: string): Date {
+  const match = value.match(/^(\d+)\s*(d|w|m|h)$/i);
+  if (!match) die(`Invalid --since value "${value}". Use: 1d, 4d, 1w, 2w, 1m, 6h`);
+  const n = parseInt(match[1], 10);
+  const unit = match[2].toLowerCase();
+  const now = new Date();
+  if (unit === "h") now.setHours(now.getHours() - n);
+  else if (unit === "d") now.setDate(now.getDate() - n);
+  else if (unit === "w") now.setDate(now.getDate() - n * 7);
+  else if (unit === "m") now.setMonth(now.getMonth() - n);
+  return now;
+}
+
+async function cmdList(alias: string, statusFilter?: string, verbose = true, all = false, sort: SortKey = "updated", since?: Date) {
   const config = loadConfig();
   const proj = getProject(config, alias);
   const owner = proj.owner ?? config.defaultOwner;
@@ -464,21 +505,23 @@ async function cmdList(alias: string, statusFilter?: string, verbose = false, al
 
   let items: any[] = data.items.filter((i: any) => i.content?.number != null);
 
-  // Fetch statuses when filtering, excluding, or showing verbose
-  const needsStatuses = verbose || statusFilter || excluded.length > 0;
-  const statusMap = needsStatuses
-    ? await fetchItemStatuses(owner, proj.number)
-    : new Map<number, string>();
+  const needsDetails = verbose || statusFilter || excluded.length > 0 || sort === "updated" || since;
+  const detailsMap = needsDetails
+    ? await fetchItemDetails(owner, proj.number)
+    : new Map<number, ItemDetails>();
 
-  const rows: { num: number; title: string; status: string }[] = [];
+  const rows: { num: number; title: string; status: string; updatedAt: string }[] = [];
   for (const item of items) {
     const num = item.content.number;
     const title = item.content.title;
-    const status = statusMap.get(num) ?? "";
+    const details = detailsMap.get(num);
+    const status = details?.status ?? "";
+    const updatedAt = details?.updatedAt ?? "";
 
     if (statusFilter && status.toLowerCase() !== statusFilter.toLowerCase()) continue;
     if (excluded.some((s) => s.toLowerCase() === status.toLowerCase())) continue;
-    rows.push({ num, title, status });
+    if (since && (!updatedAt || new Date(updatedAt) < since)) continue;
+    rows.push({ num, title, status, updatedAt });
   }
 
   if (rows.length === 0) {
@@ -487,15 +530,23 @@ async function cmdList(alias: string, statusFilter?: string, verbose = false, al
     return;
   }
 
-  // Print aligned table
+  if (sort === "updated") {
+    rows.sort((a, b) => (b.updatedAt || "").localeCompare(a.updatedAt || ""));
+  } else if (sort === "created") {
+    rows.sort((a, b) => b.num - a.num);
+  } else {
+    rows.sort((a, b) => a.num - b.num);
+  }
+
   const numWidth = Math.max(1, ...rows.map((r) => String(r.num).length));
   const titleWidth = Math.max(5, ...rows.map((r) => r.title.length));
 
   for (const r of rows) {
     const n = String(r.num).padStart(numWidth);
     const t = r.title.padEnd(titleWidth);
-    const s = r.status ? `  ${r.status}` : "";
-    console.log(`  #${n}  ${t}${s}`);
+    const parts = [r.status, r.updatedAt ? relativeTime(r.updatedAt) : ""].filter(Boolean);
+    const suffix = verbose && parts.length ? `  ${parts.join("  ")}` : "";
+    console.log(`  #${n}  ${t}${suffix}`);
   }
 }
 
@@ -523,7 +574,8 @@ Commands:
   add <alias> <issue> [--status <s>] [--priority <p>] Add an issue to a project (optionally set status/priority)
   status <alias> <issue> <name>                       Set the status of an issue
   priority <alias> <issue> <name>                     Set the priority of an issue
-  list <alias> [-v] [--all] [--status <name>]          List project items (-v shows status, --all includes excluded statuses)
+  list <alias> [-b] [--all] [--status <s>] [--sort <key>] [--since <age>]
+                                                List items (-b brief: number+title only; sort: updated|created|number; since: 1d, 4d, 1w)
   statuses <alias>                                    Show available status options`);
 }
 
@@ -563,13 +615,19 @@ switch (cmd) {
     await cmdPriority(args[0], args[1], args.slice(2).join(" "));
     break;
   case "list": {
-    if (args.length < 1) die("Usage: gh p list <alias> [-v] [--all] [--status <name>]");
-    const verbose = args.includes("-v") || args.includes("--verbose");
-    const all = args.includes("--all");
-    const filtered = args.filter(a => a !== "-v" && a !== "--verbose" && a !== "--all");
+    if (args.length < 1) die("Usage: gh p list <alias> [-b] [--all] [--status <s>] [--sort <key>] [--since <age>]");
+    const listArgs = [...args];
+    const brief = listArgs.includes("-b") || listArgs.includes("--brief");
+    const verbose = !brief;
+    const all = listArgs.includes("--all");
+    const sortFlag = takeFlag(listArgs, "--sort") as SortKey | undefined;
+    const sort: SortKey = sortFlag && ["updated", "created", "number"].includes(sortFlag) ? sortFlag : "updated";
+    const sinceFlag = takeFlag(listArgs, "--since");
+    const since = sinceFlag ? parseSince(sinceFlag) : undefined;
+    const filtered = listArgs.filter(a => a !== "-b" && a !== "--brief" && a !== "--all");
     const statusIdx = filtered.indexOf("--status");
     const filter = statusIdx >= 0 ? filtered.slice(statusIdx + 1).join(" ") : undefined;
-    await cmdList(filtered[0], filter, verbose, all);
+    await cmdList(filtered[0], filter, verbose, all, sort, since);
     break;
   }
   case "statuses":
