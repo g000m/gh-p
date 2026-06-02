@@ -2,7 +2,7 @@
 
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "fs";
 import { homedir } from "os";
-import { join } from "path";
+import { join, dirname } from "path";
 import { createInterface } from "readline/promises";
 
 // --- Types ---
@@ -475,6 +475,101 @@ async function fetchItemDetails(owner: string, projectNumber: number): Promise<M
   return detailsMap;
 }
 
+async function cmdSnapshot(alias: string, outPath?: string) {
+  const config = loadConfig();
+  const proj = getProject(config, alias);
+  const owner = proj.owner ?? config.defaultOwner;
+
+  // Single paginated query: issue content + project fields across all repos.
+  const query = `
+    query($owner: String!, $number: Int!, $cursor: String) {
+      user(login: $owner) {
+        projectV2(number: $number) {
+          items(first: 100, after: $cursor) {
+            pageInfo { hasNextPage endCursor }
+            nodes {
+              fieldValues(first: 20) {
+                nodes {
+                  ... on ProjectV2ItemFieldSingleSelectValue { name field { ... on ProjectV2FieldCommon { name } } }
+                }
+              }
+              content {
+                ... on Issue {
+                  number title body state url createdAt updatedAt closedAt
+                  repository { name }
+                  labels(first: 30) { nodes { name } }
+                  assignees(first: 10) { nodes { login } }
+                  comments { totalCount }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  `;
+
+  const records: any[] = [];
+  let cursor: string | null = null;
+  let pages = 0;
+
+  while (true) {
+    const args = [
+      "api", "graphql",
+      "-f", `query=${query}`,
+      "-f", `owner=${owner}`,
+      "-F", `number=${proj.number}`,
+    ];
+    if (cursor) args.push("-f", `cursor=${cursor}`);
+
+    const data = await ghJSON(args);
+    const items = data.data?.user?.projectV2?.items;
+    if (!items) break;
+    pages++;
+
+    for (const node of items.nodes) {
+      const c = node.content;
+      // Skip PRs and draft items — only issues carry a number via the Issue fragment.
+      if (!c || c.number == null) continue;
+      const fields: Record<string, string> = {};
+      for (const fv of node.fieldValues.nodes) {
+        if (fv?.field?.name && fv.name) fields[fv.field.name] = fv.name;
+      }
+      records.push({
+        repo: c.repository?.name ?? "",
+        number: c.number,
+        title: c.title,
+        body: c.body ?? "",
+        state: c.state,
+        url: c.url,
+        labels: (c.labels?.nodes ?? []).map((l: any) => l.name),
+        assignees: (c.assignees?.nodes ?? []).map((a: any) => a.login),
+        comments: c.comments?.totalCount ?? 0,
+        status: fields["Status"] ?? "",
+        priority: fields["Priority"] ?? "",
+        size: fields["Size"] ?? "",
+        createdAt: c.createdAt,
+        updatedAt: c.updatedAt,
+        closedAt: c.closedAt ?? null,
+      });
+    }
+
+    if (!items.pageInfo.hasNextPage) break;
+    cursor = items.pageInfo.endCursor;
+  }
+
+  const ndjson = records.map((r) => JSON.stringify(r)).join("\n") + "\n";
+
+  if (outPath) {
+    mkdirSync(dirname(outPath), { recursive: true });
+    writeFileSync(outPath, ndjson);
+    console.log(`Wrote ${records.length} issues (${pages} page${pages === 1 ? "" : "s"}) to ${outPath}`);
+  } else {
+    process.stdout.write(ndjson);
+    console.error(`Wrote ${records.length} issues (${pages} page${pages === 1 ? "" : "s"}) to stdout`);
+  }
+}
+
 type SortKey = "updated" | "created" | "number";
 
 function parseSince(value: string): Date {
@@ -490,11 +585,11 @@ function parseSince(value: string): Date {
   return now;
 }
 
-async function cmdList(alias: string, statusFilter?: string, verbose = true, all = false, sort: SortKey = "updated", since?: Date) {
+async function cmdList(alias: string, statusFilter?: string, verbose = true, all = false, sort: SortKey = "updated", since?: Date, showRepo = false, excludeExtra: string[] = []) {
   const config = loadConfig();
   const proj = getProject(config, alias);
   const owner = proj.owner ?? config.defaultOwner;
-  const excluded = all ? [] : (proj.excludeStatuses ?? []);
+  const excluded = all ? [...excludeExtra] : [...(proj.excludeStatuses ?? []), ...excludeExtra];
 
   const data = await ghJSON([
     "project", "item-list", String(proj.number),
@@ -510,10 +605,12 @@ async function cmdList(alias: string, statusFilter?: string, verbose = true, all
     ? await fetchItemDetails(owner, proj.number)
     : new Map<number, ItemDetails>();
 
-  const rows: { num: number; title: string; status: string; updatedAt: string }[] = [];
+  const rows: { num: number; title: string; repo: string; status: string; updatedAt: string }[] = [];
   for (const item of items) {
     const num = item.content.number;
     const title = item.content.title;
+    const repoFull: string = item.content.repository ?? "";
+    const repo = repoFull.includes("/") ? repoFull.split("/").pop()! : repoFull;
     const details = detailsMap.get(num);
     const status = details?.status ?? "";
     const updatedAt = details?.updatedAt ?? "";
@@ -521,7 +618,7 @@ async function cmdList(alias: string, statusFilter?: string, verbose = true, all
     if (statusFilter && status.toLowerCase() !== statusFilter.toLowerCase()) continue;
     if (excluded.some((s) => s.toLowerCase() === status.toLowerCase())) continue;
     if (since && (!updatedAt || new Date(updatedAt) < since)) continue;
-    rows.push({ num, title, status, updatedAt });
+    rows.push({ num, title, repo, status, updatedAt });
   }
 
   if (rows.length === 0) {
@@ -539,14 +636,16 @@ async function cmdList(alias: string, statusFilter?: string, verbose = true, all
   }
 
   const numWidth = Math.max(1, ...rows.map((r) => String(r.num).length));
+  const repoWidth = showRepo ? Math.max(4, ...rows.map((r) => r.repo.length)) : 0;
   const titleWidth = Math.max(5, ...rows.map((r) => r.title.length));
 
   for (const r of rows) {
     const n = String(r.num).padStart(numWidth);
+    const repoCol = showRepo ? `  ${r.repo.padEnd(repoWidth)}` : "";
     const t = r.title.padEnd(titleWidth);
     const parts = [r.status, r.updatedAt ? relativeTime(r.updatedAt) : ""].filter(Boolean);
     const suffix = verbose && parts.length ? `  ${parts.join("  ")}` : "";
-    console.log(`  #${n}  ${t}${suffix}`);
+    console.log(`  #${n}${repoCol}  ${t}${suffix}`);
   }
 }
 
@@ -574,9 +673,10 @@ Commands:
   add <alias> <issue> [--status <s>] [--priority <p>] Add an issue to a project (optionally set status/priority)
   status <alias> <issue> <name>                       Set the status of an issue
   priority <alias> <issue> <name>                     Set the priority of an issue
-  list <alias> [-b] [--all] [--status <s>] [--sort <key>] [--since <age>]
-                                                List items (-b brief: number+title only; sort: updated|created|number; since: 1d, 4d, 1w)
-  statuses <alias>                                    Show available status options`);
+  list <alias> [-b] [--all] [--status <s>] [--exclude <s>] [--sort <key>] [--since <age>] [--repo]
+                                                List items (-b brief; --exclude comma-separated statuses; --repo show repo column; sort: updated|created|number; since: 1d, 4d, 1w)
+  statuses <alias>                                    Show available status options
+  snapshot <alias> [--out <path>]                     Dump all issues (body, labels, status/priority/size) as NDJSON (stdout if no --out)`);
 }
 
 function takeFlag(args: string[], name: string): string | undefined {
@@ -615,25 +715,35 @@ switch (cmd) {
     await cmdPriority(args[0], args[1], args.slice(2).join(" "));
     break;
   case "list": {
-    if (args.length < 1) die("Usage: gh p list <alias> [-b] [--all] [--status <s>] [--sort <key>] [--since <age>]");
+    if (args.length < 1) die("Usage: gh p list <alias> [-b] [--all] [--status <s>] [--exclude <s>] [--sort <key>] [--since <age>] [--repo]");
     const listArgs = [...args];
     const brief = listArgs.includes("-b") || listArgs.includes("--brief");
     const verbose = !brief;
     const all = listArgs.includes("--all");
+    const showRepo = listArgs.includes("--repo");
     const sortFlag = takeFlag(listArgs, "--sort") as SortKey | undefined;
     const sort: SortKey = sortFlag && ["updated", "created", "number"].includes(sortFlag) ? sortFlag : "updated";
     const sinceFlag = takeFlag(listArgs, "--since");
     const since = sinceFlag ? parseSince(sinceFlag) : undefined;
-    const filtered = listArgs.filter(a => a !== "-b" && a !== "--brief" && a !== "--all");
+    const excludeFlag = takeFlag(listArgs, "--exclude");
+    const excludeExtra = excludeFlag ? excludeFlag.split(",").map((s) => s.trim()).filter(Boolean) : [];
+    const filtered = listArgs.filter(a => a !== "-b" && a !== "--brief" && a !== "--all" && a !== "--repo");
     const statusIdx = filtered.indexOf("--status");
     const filter = statusIdx >= 0 ? filtered.slice(statusIdx + 1).join(" ") : undefined;
-    await cmdList(filtered[0], filter, verbose, all, sort, since);
+    await cmdList(filtered[0], filter, verbose, all, sort, since, showRepo, excludeExtra);
     break;
   }
   case "statuses":
     if (args.length < 1) die("Usage: gh p statuses <alias>");
     await cmdStatuses(args[0]);
     break;
+  case "snapshot": {
+    if (args.length < 1) die("Usage: gh p snapshot <alias> [--out <path>]");
+    const snapArgs = [...args];
+    const out = takeFlag(snapArgs, "--out");
+    await cmdSnapshot(snapArgs[0], out);
+    break;
+  }
   default:
     usage();
     if (cmd && cmd !== "--help" && cmd !== "-h" && cmd !== "help") process.exit(1);
